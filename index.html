@@ -56,9 +56,11 @@
                 <p id="role-display" class="text-xs font-bold text-gray-500 uppercase">Role: Initializing...</p>
                 <p id="objective-display" class="text-sm font-medium">Objective: Drive to the first window</p>
             </div>
-            <div id="stats-panel" class="bg-black bg-opacity-70 p-3 rounded-lg text-white text-xs space-y-1">
+        <div id="stats-panel" class="bg-black bg-opacity-70 p-3 rounded-lg text-white text-xs space-y-1">
                 <p>Lifetime Revenue: ₹<span id="stat-revenue">0</span></p>
                 <p>Orders Served: <span id="stat-orders">0</span></p>
+                <p>Order Accuracy: <span id="stat-accuracy">100</span>%</p>
+                <p>Avg Service Time: <span id="stat-service">0</span>s</p>
                 <p>Players Online: <span id="online-count">1</span></p>
             </div>
         </div>
@@ -84,6 +86,14 @@
                     <h3 class="font-bold border-b mb-2 pb-2">Checkout</h3>
                     <div id="order-items" class="flex-1 overflow-y-auto text-sm space-y-2 mb-4"></div>
                     <div class="border-t pt-2">
+                        <div class="mb-3">
+                            <p class="text-xs font-bold text-gray-500 uppercase mb-2">Payment Method</p>
+                            <div class="grid gap-2 text-xs">
+                                <label class="flex items-center gap-2"><input type="radio" name="payment" value="Cash" checked> Cash</label>
+                                <label class="flex items-center gap-2"><input type="radio" name="payment" value="Card"> Card</label>
+                                <label class="flex items-center gap-2"><input type="radio" name="payment" value="Digital"> Digital Pay</label>
+                            </div>
+                        </div>
                         <div class="flex justify-between font-bold text-lg"><span>Total</span><span>₹<span id="order-total">0</span></span></div>
                         <button id="checkout-btn" onclick="submitOrder()" class="w-full mt-4 mcd-yellow text-red-800 font-bold py-3 rounded-xl disabled:opacity-50">SEND TO KITCHEN</button>
                     </div>
@@ -106,19 +116,44 @@
     import { getFirestore, doc, setDoc, getDoc, updateDoc, collection, onSnapshot, query, addDoc, deleteDoc, serverTimestamp } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js';
 
     // --- CONFIG & INIT ---
-    const firebaseConfig = JSON.parse(__firebase_config);
+    const firebaseEnabled = typeof __firebase_config !== 'undefined';
+    const firebaseConfig = firebaseEnabled ? JSON.parse(__firebase_config) : null;
     const appId = typeof __app_id !== 'undefined' ? __app_id : 'mcd-drive-thru-india';
-    const app = initializeApp(firebaseConfig);
-    const auth = getAuth(app);
-    const db = getFirestore(app);
+    const app = firebaseEnabled ? initializeApp(firebaseConfig) : null;
+    const auth = firebaseEnabled ? getAuth(app) : null;
+    const db = firebaseEnabled ? getFirestore(app) : null;
 
     const MCD_MENU = [
-        { id: 'mt', name: 'McAloo Tikki', price: 85, emoji: '🍔' },
-        { id: 'mv', name: 'McVeggie', price: 155, emoji: '🍔' },
-        { id: 'mc', name: 'McChicken', price: 175, emoji: '🍗' },
-        { id: 'msp', name: 'McSpicy Chicken', price: 245, emoji: '🌶️' },
-        { id: 'fs', name: 'Large Fries', price: 110, emoji: '🍟' },
-        { id: 'coke', name: 'Coca-Cola', price: 95, emoji: '🥤' }
+        {
+            category: 'Burgers & Wraps',
+            items: [
+                { id: 'mt', name: 'McAloo Tikki', price: 89, emoji: '🍔' },
+                { id: 'mv', name: 'McVeggie', price: 159, emoji: '🥬' },
+                { id: 'mc', name: 'McChicken', price: 175, emoji: '🍗' },
+                { id: 'msp', name: 'McSpicy Premium Chicken', price: 249, emoji: '🌶️' }
+            ]
+        },
+        {
+            category: 'Combos / Value Meals',
+            items: [
+                { id: 'mvc', name: 'McVeggie Combo', price: 249, emoji: '🍟' },
+                { id: 'mcc', name: 'McChicken Combo', price: 289, emoji: '🥤' }
+            ]
+        },
+        {
+            category: 'Sides',
+            items: [
+                { id: 'fs', name: 'Small Fries', price: 85, emoji: '🍟' },
+                { id: 'nug', name: '6 Pc Chicken Nuggets', price: 289, emoji: '🍗' }
+            ]
+        },
+        {
+            category: 'Beverages & Desserts',
+            items: [
+                { id: 'coke', name: 'Coca-Cola', price: 95, emoji: '🥤' },
+                { id: 'mf', name: 'McFlurry Oreo', price: 145, emoji: '🍦' }
+            ]
+        }
     ];
 
     let state = {
@@ -129,10 +164,11 @@
         playerVelocity: 0,
         keys: {},
         currentOrder: [],
-        metrics: { revenue: 0, served: 0 },
+        metrics: { revenue: 0, served: 0, correct: 0, totalServiceTime: 0 },
         isInteracting: false,
         otherPlayers: {},
-        activeOrders: []
+        activeOrders: [],
+        orderAccuracy: {}
     };
 
     let scene, camera, renderer, playerMesh;
@@ -140,6 +176,14 @@
 
     // --- FIREBASE AUTH ---
     const initAuth = async () => {
+        if (!firebaseEnabled) {
+            state.user = { uid: `local-${Math.random().toString(16).slice(2)}` };
+            document.getElementById('loading-auth').classList.add('hidden');
+            document.getElementById('role-buttons').classList.remove('hidden');
+            document.getElementById('user-id-display').innerText = 'Local mode: single player';
+            document.getElementById('online-count').innerText = '1';
+            return;
+        }
         try {
             if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
                 await signInWithCustomToken(auth, __initial_auth_token);
@@ -149,28 +193,30 @@
         } catch (err) { console.error("Auth failed", err); }
     };
 
-    onAuthStateChanged(auth, async (user) => {
-        if (user) {
-            state.user = user;
-            document.getElementById('loading-auth').classList.add('hidden');
-            document.getElementById('role-buttons').classList.remove('hidden');
-            document.getElementById('user-id-display').innerText = `Logged in: ${user.uid}`;
-            
-            // Load persistent metrics
-            const metricsDoc = await getDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'profile', 'stats'));
-            if (metricsDoc.exists()) {
-                state.metrics = metricsDoc.data();
-                updateHUD();
+    if (firebaseEnabled) {
+        onAuthStateChanged(auth, async (user) => {
+            if (user) {
+                state.user = user;
+                document.getElementById('loading-auth').classList.add('hidden');
+                document.getElementById('role-buttons').classList.remove('hidden');
+                document.getElementById('user-id-display').innerText = `Logged in: ${user.uid}`;
+                
+                // Load persistent metrics
+                const metricsDoc = await getDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'profile', 'stats'));
+                if (metricsDoc.exists()) {
+                    state.metrics = normalizeMetrics(metricsDoc.data());
+                    updateHUD();
+                }
+                
+                // Start sync listeners
+                startSync();
             }
-            
-            // Start sync listeners
-            startSync();
-        }
-    });
+        });
+    }
 
     // --- SYNC ENGINE ---
     function startSync() {
-        if (!state.user) return;
+        if (!state.user || !firebaseEnabled) return;
 
         // Sync Players
         const playersRef = collection(db, 'artifacts', appId, 'public', 'data', 'players');
@@ -203,7 +249,7 @@
     }
 
     async function updateHeartbeat() {
-        if (!state.user || !state.role) return;
+        if (!state.user || !state.role || !firebaseEnabled) return;
         const playerRef = doc(db, 'artifacts', appId, 'public', 'data', 'players', state.user.uid);
         await setDoc(playerRef, {
             role: state.role,
@@ -276,17 +322,24 @@
 
     function populateMenu() {
         const grid = document.getElementById('menu-grid');
-        grid.innerHTML = MCD_MENU.map(i => `
-            <button onclick="addToOrder('${i.id}')" class="bg-white border p-4 rounded-xl flex flex-col items-center hover:bg-yellow-50">
-                <span class="text-3xl">${i.emoji}</span>
-                <span class="font-bold text-xs mt-1">${i.name}</span>
-                <span class="text-red-600 font-bold">₹${i.price}</span>
-            </button>
+        grid.innerHTML = MCD_MENU.map(section => `
+            <div class="col-span-2 md:col-span-3">
+                <h4 class="text-xs font-black uppercase text-gray-500 mb-2">${section.category}</h4>
+                <div class="grid grid-cols-2 md:grid-cols-3 gap-3">
+                    ${section.items.map(i => `
+                        <button onclick="addToOrder('${i.id}')" class="bg-white border p-4 rounded-xl flex flex-col items-center hover:bg-yellow-50">
+                            <span class="text-3xl">${i.emoji}</span>
+                            <span class="font-bold text-xs mt-1 text-center">${i.name}</span>
+                            <span class="text-red-600 font-bold">₹${i.price}</span>
+                        </button>
+                    `).join('')}
+                </div>
+            </div>
         `).join('');
     }
 
     window.addToOrder = function(id) {
-        const item = MCD_MENU.find(i => i.id === id);
+        const item = MCD_MENU.flatMap(section => section.items).find(i => i.id === id);
         state.currentOrder.push(item);
         updateOrderSummary();
     };
@@ -300,32 +353,64 @@
     window.submitOrder = async function() {
         if (state.currentOrder.length === 0) return;
         const total = state.currentOrder.reduce((a, b) => a + b.price, 0);
+        const paymentMethod = document.querySelector('input[name="payment"]:checked')?.value || 'Cash';
         
-        await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'orders'), {
-            customerId: state.user.uid,
-            items: state.currentOrder.map(i => i.name),
-            total: total,
-            status: 'pending',
-            created: serverTimestamp()
-        });
+        if (firebaseEnabled) {
+            await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'orders'), {
+                customerId: state.user.uid,
+                items: state.currentOrder.map(i => i.name),
+                total: total,
+                payment: paymentMethod,
+                status: 'pending',
+                created: serverTimestamp(),
+                createdAt: Date.now()
+            });
+        } else {
+            state.activeOrders.push({
+                id: `local-${Date.now()}`,
+                customerId: state.user.uid,
+                items: state.currentOrder.map(i => i.name),
+                total,
+                payment: paymentMethod,
+                status: 'pending',
+                createdAt: Date.now()
+            });
+            updateKitchenQueue();
+        }
         
         state.currentOrder = [];
         closeInteraction();
-        showMessage("Order Sent", "The kitchen has received your order!");
+        showMessage("Order Sent", `Pay via ${paymentMethod} at the window.`);
     };
 
-    window.prepareOrder = async function(orderId, total) {
+    window.setOrderAccuracy = function(orderId, isAccurate) {
+        state.orderAccuracy[orderId] = isAccurate;
+    };
+
+    window.prepareOrder = async function(orderId, total, createdAt) {
         // Remove from public queue
-        await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'orders', orderId));
+        if (firebaseEnabled) {
+            await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'orders', orderId));
+        } else {
+            state.activeOrders = state.activeOrders.filter(order => order.id !== orderId);
+        }
         
         // Update persistent stats
         state.metrics.revenue += total;
         state.metrics.served += 1;
-        await setDoc(doc(db, 'artifacts', appId, 'users', state.user.uid, 'profile', 'stats'), state.metrics);
+        const accuracy = state.orderAccuracy[orderId] !== false;
+        if (accuracy) state.metrics.correct += 1;
+        if (createdAt) {
+            const serviceTime = Math.max(0, Math.round((Date.now() - createdAt) / 1000));
+            state.metrics.totalServiceTime += serviceTime;
+        }
+        if (firebaseEnabled) {
+            await setDoc(doc(db, 'artifacts', appId, 'users', state.user.uid, 'profile', 'stats'), state.metrics);
+        }
         
         updateHUD();
         updateKitchenQueue();
-        showMessage("Served", `Collected ₹${total}! Stats updated.`);
+        showMessage("Served", `Collected ₹${total}! ${accuracy ? "Accurate build" : "Issue logged"}.`);
     };
 
     function updateKitchenQueue() {
@@ -336,8 +421,15 @@
         }
         q.innerHTML = state.activeOrders.map(o => `
             <div class="bg-zinc-800 p-4 rounded border-l-4 border-yellow-500 flex justify-between items-center">
-                <div><div class="font-bold text-yellow-500">New Order</div><div class="text-xs text-zinc-400">${o.items.join(', ')}</div></div>
-                <button onclick="prepareOrder('${o.id}', ${o.total})" class="bg-green-600 px-4 py-2 rounded text-xs font-bold">SERVE (₹${o.total})</button>
+                <div class="pr-2">
+                    <div class="font-bold text-yellow-500">New Order • ₹${o.total}</div>
+                    <div class="text-xs text-zinc-400">${o.items.join(', ')}</div>
+                    <div class="text-[11px] text-zinc-300 mt-1">Payment: ${o.payment || 'Cash'}</div>
+                    <label class="text-[11px] text-zinc-300 mt-2 flex items-center gap-2">
+                        <input type="checkbox" checked onchange="setOrderAccuracy('${o.id}', this.checked)"> Correct build
+                    </label>
+                </div>
+                <button onclick="prepareOrder('${o.id}', ${o.total}, ${o.createdAt || 'null'})" class="bg-green-600 px-4 py-2 rounded text-xs font-bold">SERVE</button>
             </div>
         `).join('');
     }
@@ -382,6 +474,19 @@
     function updateHUD() {
         document.getElementById('stat-revenue').innerText = state.metrics.revenue;
         document.getElementById('stat-orders').innerText = state.metrics.served;
+        const accuracy = state.metrics.served ? Math.round((state.metrics.correct / state.metrics.served) * 100) : 100;
+        const avgService = state.metrics.served ? Math.round(state.metrics.totalServiceTime / state.metrics.served) : 0;
+        document.getElementById('stat-accuracy').innerText = accuracy;
+        document.getElementById('stat-service').innerText = avgService;
+    }
+
+    function normalizeMetrics(metrics) {
+        return {
+            revenue: metrics.revenue || 0,
+            served: metrics.served || 0,
+            correct: metrics.correct || 0,
+            totalServiceTime: metrics.totalServiceTime || 0
+        };
     }
 
     function animate() {
